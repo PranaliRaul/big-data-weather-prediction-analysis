@@ -1,0 +1,153 @@
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.functions import col, input_file_name, regexp_extract, isnull, isnan, lit, hour, to_timestamp, to_date, when, concat_ws, avg
+
+# Start Spark Session
+spark = SparkSession.builder.appName("WeatherFileAnalysis").getOrCreate()
+
+# Paths
+base_path = "s3://weatherdatadbda/moba/w_d_3/"
+
+# Read CSVs with file info
+df_all = spark.read.option("header", True).csv(base_path + "*.csv") \
+    .withColumn("file_only", input_file_name())
+
+# Extract city from file path
+df_with_city = df_all.withColumn(
+    "city",
+    regexp_extract(col("file_only"), r"/([a-zA-Z_]+?)(?:_\d+)?\.csv$", 1)
+)
+
+# ====================  NULL COLUMN CHECK ====================
+columns_to_check = [col_name for col_name in df_with_city.columns if col_name not in ["file_only", "city"]]
+
+null_counts = {
+    col_name: df_with_city.filter(isnull(col(col_name)) | isnan(col(col_name)) | (col(col_name) == "")).count()
+    for col_name in columns_to_check
+    if df_with_city.filter(isnull(col(col_name)) | isnan(col(col_name)) | (col(col_name) == "")).count() > 0
+}
+
+print(" Columns containing NULL, NaN, or empty string values:")
+for col_name, count in null_counts.items():
+    print(f" {col_name}: {count} nulls")
+
+# Fill specific null values
+df_filled = df_with_city.fillna({"snow_depth": 0})
+
+# ====================  CITY CLASSIFICATION ====================
+city_file_counts = df_with_city.groupBy("city") \
+    .agg(F.countDistinct("file_only").alias("file_count"))
+
+multi_city_list = city_file_counts.filter("file_count > 1").select("city").rdd.flatMap(lambda x: x).collect()
+single_city_list = city_file_counts.filter("file_count = 1").select("city").rdd.flatMap(lambda x: x).collect()
+
+# ====================  UTILITY FUNCTION ====================
+def create_12hr_agg(df_input):
+    df = df_input.withColumn("datetime_ts", to_timestamp("date")) \
+        .withColumn("hour", hour("datetime_ts")) \
+        .withColumn("day_part", when(col("hour") < 12, "AM").otherwise("PM")) \
+        .withColumn("date", to_date(col("datetime_ts"))) \
+        .withColumn("new_datetime", concat_ws(" ",
+                                              col("date"),
+                                              when(col("day_part") == "AM", lit("00:00:00"))
+                                                 .otherwise(lit("12:00:00"))))
+
+    key_metrics = [
+        "temperature_2m", "relative_humidity_2m", "dew_point_2m", "apparent_temperature",
+        "precipitation", "rain", "snowfall", "snow_depth", "pressure_msl", "surface_pressure",
+        "cloud_cover", "cloud_cover_low", "cloud_cover_mid", "cloud_cover_high",
+        "wind_speed_10m", "wind_speed_100m", "wind_direction_10m", "wind_direction_100m",
+        "wind_gusts_10m"
+    ]
+
+    agg_exprs = [avg(col(m)).alias(m) for m in key_metrics]
+    df_12hr = df.groupBy("new_datetime", "city").agg(*agg_exprs)
+    return df_12hr.select("new_datetime", "city", *key_metrics).orderBy("new_datetime", "city")
+
+# ==================== MULTI-FILE MERGING ====================
+df_multi = df_filled.filter(col("city").isin(multi_city_list))
+
+# Merge multiple files by date + city
+numeric_cols = [c for c, t in df_multi.dtypes if t in ['double', 'int', 'float', 'long'] and c not in ['date', 'city']]
+string_cols = [c for c, t in df_multi.dtypes if t in ['string'] and c not in ['date', 'city']]
+
+merge_exprs = (
+    [F.avg(col(c)).alias(c) for c in numeric_cols] +
+    [F.first(col(c), ignorenulls=True).alias(c) for c in string_cols]
+)
+
+df_merged = df_multi.groupBy("date", "city").agg(*merge_exprs)
+df_12hr_multi = create_12hr_agg(df_merged)
+
+# ==================== SINGLE FILE CITIES ====================
+df_single = df_filled.filter(col("city").isin(single_city_list))
+df_12hr_single = create_12hr_agg(df_single)
+
+# ==================== 
+FINAL UNION ====================
+df_12hr_final = df_12hr_multi.unionByName(df_12hr_single).orderBy("new_datetime", "city")
+
+# Final Result Preview
+df_12hr_final.show(50, truncate=False)
+
+
+
+
+
+
+
+
+
+from pyspark.sql.functions import col
+
+cities = df_12hr_final.select("city").distinct().rdd.flatMap(lambda x: x).collect()
+
+for city in cities:
+    print(f"🚀 Processing: {city}")
+    
+    city_df = df_12hr_final.filter(col("city") == city)
+    
+    safe_city_name = city.strip().lower().replace(" ", "_")
+    output_path = f"s3://cleandataweathergroup7/final_output_temp/{safe_city_name}"
+    
+    # Write to a temporary folder (Spark creates a folder here)
+    city_df.coalesce(1).write.mode("overwrite").option("header", True).csv(output_path)
+    
+    print(f" Written folder: {output_path}")
+
+
+✅ Prerequisites:
+You have AWS CLI installed and configured on your machine or EMR (aws configure).
+
+Your current shell environment can run bash scripts.
+
+✅ Shell Script: Move and Rename CSV Files
+
+
+#!/bin/bash
+
+# Define source and destination buckets
+SOURCE_BUCKET="s3://cleandataweathergroup7/final_output_temp"
+DEST_BUCKET="s3://cleandataweathergroup7/final_output"
+
+# List all city folders in the source bucket
+cities=$(aws s3 ls $SOURCE_BUCKET/ | awk '{print $2}' | sed 's#/##')
+
+for city in $cities; do
+    echo "Processing $city..."
+
+    # Find the part file in the city folder
+    part_file=$(aws s3 ls "$SOURCE_BUCKET/$city/" | grep "part-" | awk '{print $4}')
+
+    if [ -n "$part_file" ]; then
+        # Copy and rename the part file to the destination bucket with city.csv name
+        aws s3 cp "$SOURCE_BUCKET/$city/$part_file" "$DEST_BUCKET/${city}.csv"
+        echo "Copied $city.csv"
+    else
+        echo "No part file found for $city"
+    fi
+done
+
+
+chmod +x move_and_rename.sh
+./move_and_rename.sh
